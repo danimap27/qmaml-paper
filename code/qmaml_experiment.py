@@ -587,7 +587,6 @@ def meta_train_classical(model, loader, inner_lr, outer_lr, n_steps):
     return train_accs
 
 
-@torch.no_grad()
 def test_classical(model, loader, inner_lr, n_steps):
     accs = []
     loss_fn = nn.CrossEntropyLoss()
@@ -605,7 +604,8 @@ def test_classical(model, loader, inner_lr, n_steps):
                 loss_fn(m(sx_t), sy_t).backward()
                 opt.step()
             m.eval()
-            acc = (m(qx_t).argmax(1) == qy_t).float().mean().item()
+            with torch.no_grad():
+                acc = (m(qx_t).argmax(1) == qy_t).float().mean().item()
             accs.append(acc)
     return float(np.mean(accs)), float(np.std(accs) / np.sqrt(len(accs)))
 
@@ -623,32 +623,43 @@ def analyze_qfim_spectrum(model, x_batch, title="QFIM Spectrum"):
     return fisher.detach().flatten().numpy()
 
 
-def analyze_gradient_variance(depths=[1, 2, 3, 4], n_samples=50, seed=42):
+def analyze_gradient_variance(qubit_counts=[2, 3, 4, 5, 6], n_samples=100, seed=42):
     """
-    Analiza varianza del gradiente vs. profundidad del circuito.
-    Demuestra que circuitos poco profundos evitan barren plateaus.
+    Analiza varianza del gradiente vs. número de qubits (anchura).
+    Barren plateaus: Var[∂<O>/∂θ] ∝ 2^(-n_qubits) — decay exponencial con anchura.
+    Parámetros uniformes en [-π, π] para capturar el paisaje completo.
     """
     rng = np.random.RandomState(seed)
     variances = {}
-    for depth in depths:
+    for n_q in qubit_counts:
+        tmp_dev = qml.device("lightning.qubit", wires=n_q)
+
+        @qml.qnode(tmp_dev, diff_method="adjoint")
+        def _circuit(x, theta_sh, theta_tk):
+            for i in range(n_q):
+                qml.RY(np.pi * x[i], wires=i)
+            qml.StronglyEntanglingLayers(theta_sh, wires=range(n_q))
+            qml.StronglyEntanglingLayers(theta_tk, wires=range(n_q))
+            return [qml.expval(qml.PauliZ(i)) for i in range(n_q)]
+
         grads = []
         for _ in range(n_samples):
-            theta = torch.randn(depth, N_QUBITS, 3) * 0.1
-            x     = torch.tanh(torch.randn(N_QUBITS))
+            # Parámetros uniformes en [-π, π] — Haar-random-like
+            theta_sh = (rng.rand(N_SHARED, n_q, 3) * 2 - 1) * np.pi
+            theta_tk = (rng.rand(N_TASK,   n_q, 3) * 2 - 1) * np.pi
+            x_val    = rng.uniform(-1, 1, n_q)
 
-            # Gradiente via parameter-shift del primer parámetro
-            eps = 0.5 * np.pi
-            t_plus  = theta.clone(); t_plus[0, 0, 0]  += eps
-            t_minus = theta.clone(); t_minus[0, 0, 0] -= eps
+            eps     = 0.5 * np.pi
+            tk_plus  = theta_tk.copy(); tk_plus[0, 0, 0]  += eps
+            tk_minus = theta_tk.copy(); tk_minus[0, 0, 0] -= eps
 
-            dummy_shared = torch.zeros(1, N_QUBITS, 3)
-            out_p = np.array(vqc_circuit(x.numpy(), dummy_shared.numpy(), t_plus.numpy()))
-            out_m = np.array(vqc_circuit(x.numpy(), dummy_shared.numpy(), t_minus.numpy()))
+            out_p = np.array(_circuit(x_val, theta_sh, tk_plus))
+            out_m = np.array(_circuit(x_val, theta_sh, tk_minus))
             grad  = float(np.mean((out_p - out_m) / 2.0))
             grads.append(grad)
 
-        variances[depth] = float(np.var(grads))
-        print(f"    depth={depth}: var(∂<O>/∂θ₀) = {variances[depth]:.6f}")
+        variances[n_q] = float(np.var(grads))
+        print(f"    n_qubits={n_q}: Var[∂<O>/∂θ] = {variances[n_q]:.2e}")
 
     return variances
 
@@ -747,35 +758,33 @@ def fig_qfim_spectrum(fisher_vals: np.ndarray):
 
 
 def fig_barren_plateau(variances: dict):
-    """Varianza del gradiente vs. profundidad del circuito."""
+    """Varianza del gradiente vs. número de qubits — barren plateau exponencial."""
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.set_title("Gradient Variance vs. Circuit Depth\n"
-                 "(Barren Plateau Analysis)", fontsize=12, fontweight="bold")
+    ax.set_title("Gradient Variance vs. Circuit Width\n"
+                 "Barren Plateau: Var[∂⟨O⟩/∂θ] ∝ $2^{-n}$", fontsize=12, fontweight="bold")
 
-    depths = list(variances.keys())
-    vars_  = list(variances.values())
+    nq    = list(variances.keys())
+    vars_ = list(variances.values())
 
-    ax.semilogy(depths, vars_, "o-", color="#55A868", linewidth=2.5,
-                markersize=8, markerfacecolor="white", markeredgewidth=2)
-    ax.fill_between(depths, [v * 0.5 for v in vars_], [v * 2 for v in vars_],
-                    color="#55A868", alpha=0.15)
+    ax.semilogy(nq, vars_, "o-", color="#55A868", linewidth=2.5,
+                markersize=8, markerfacecolor="white", markeredgewidth=2,
+                label="Observed variance")
 
-    # Ajuste exponencial teórico
-    if len(depths) > 1:
-        coeffs = np.polyfit(depths, np.log(vars_), 1)
-        x_fit  = np.linspace(min(depths), max(depths), 100)
+    # Ajuste exponencial teórico: esperamos pendiente ≈ -log(2) ≈ -0.693
+    if len(nq) > 1:
+        coeffs = np.polyfit(nq, np.log(vars_), 1)
+        x_fit  = np.linspace(min(nq), max(nq), 100)
         ax.semilogy(x_fit, np.exp(np.polyval(coeffs, x_fit)),
-                    "--", color="gray", alpha=0.7, label=f"Exp. fit: $e^{{{coeffs[0]:.2f}d}}$")
-        ax.legend()
+                    "--", color="gray", alpha=0.8,
+                    label=f"Exp. fit: $e^{{{coeffs[0]:.2f} \\cdot n}}$")
+        # Teórica
+        v0 = vars_[0]
+        ax.semilogy(x_fit, v0 * 2 ** (-(np.array(x_fit) - nq[0])),
+                    ":", color="red", alpha=0.6, label="Teórico: $2^{-n}$")
 
-    ax.set_xlabel("Circuit Depth (n_layers)")
+    ax.set_xlabel("Number of Qubits (n)")
     ax.set_ylabel("Var(∂⟨O⟩/∂θ₀) — log scale")
-    ax.set_xticks(depths)
-
-    # Marcar el depth óptimo (menos plateau)
-    best_depth = depths[np.argmax(vars_)]
-    ax.axvline(best_depth, color="orange", linestyle=":", alpha=0.8,
-               label=f"Optimal depth = {best_depth}")
+    ax.set_xticks(nq)
     ax.legend(fontsize=9)
     sns.despine(ax=ax)
     plt.tight_layout()
@@ -832,7 +841,7 @@ def main():
 
     # ── [1] Barren plateau analysis ───────────────────────────────────────────
     print("\n[1] Análisis barren plateau vs. profundidad del circuito...")
-    bp_variances = analyze_gradient_variance(depths=[1, 2, 3, 4], n_samples=100)
+    bp_variances = analyze_gradient_variance(qubit_counts=[2, 3, 4, 5, 6], n_samples=100)
     fig_barren_plateau(bp_variances)
 
     # ── [2] QFIM spectrum (con modelo inicializado) ───────────────────────────
