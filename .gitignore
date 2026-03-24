@@ -1,0 +1,12 @@
+data/
+__pycache__/
+*.pyc
+figures/*.png
+results/
+paper/*.aux
+paper/*.log
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.out
